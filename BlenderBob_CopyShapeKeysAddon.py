@@ -2,7 +2,10 @@ bl_info = {
     "name": "Shapekey Copy",
     "blender": (4, 1, 0),
     "category": "Tool",
+    "version": (1, 0),   
     "author": "Blender Bob, Chat GPT",
+    "description": "Copy shapekeys from one mesh to another",
+    "support": "COMMUNITY" 
 }
 
 import bpy
