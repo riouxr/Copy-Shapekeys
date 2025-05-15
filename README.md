@@ -1,8 +1,8 @@
 # Copy-Shapekeys
-Copy Shapekeys allows you to copy the shapkeys (with animation) from one mesh to another as long as they both have the same topology.
+Copy Shapekeys allows you to copy the shape keys from one mesh to another. 
 
 Once installed, the addon will appear in the viewport's tool tab.
 
-Select the source, select the destination and click the copy button.
+Select the source(s), select the destination and click the copy shape keys button. Same thing for the animation.
 
-Please watch this video for more details: https://www.youtube.com/watch?v=Q13pBes8Wfc
+Please watch this video for more details: https://youtu.be/pBjBGArJUvA
