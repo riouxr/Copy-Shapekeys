@@ -19,7 +19,76 @@ class ShapekeyTransferPanel(bpy.types.Panel):
         col.prop(context.scene, "active_only", text="Active Only")
         col.operator("object.shapekey_transfer", text="Copy Shape keys", icon="COPYDOWN")
         col.operator("object.shapekey_animation_transfer", text="Copy Animation", icon="ANIM")
+        col.operator("object.vertexgroup_transfer", text="Copy Vertex Groups", icon="GROUP_VERTEX")
 
+class VertexGroupTransferOperator(bpy.types.Operator):
+    """Copy vertex groups from selected sources to the active target (requires identical topology)."""
+    bl_idname = "object.vertexgroup_transfer"
+    bl_label = "Copy Vertex Groups"
+    bl_description = "Copy vertex groups from selected objects to active target (same topology)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            self.report({'ERROR'}, "Operator must be run in Object mode.")
+            return {'CANCELLED'}
+
+        selected = context.selected_objects
+        if len(selected) < 2:
+            self.report({'ERROR'}, "Select at least one source object and one target object.")
+            return {'CANCELLED'}
+
+        target = context.view_layer.objects.active
+        sources = [o for o in selected if o != target]
+
+        if target.type != 'MESH':
+            self.report({'ERROR'}, "Target must be a mesh object.")
+            return {'CANCELLED'}
+
+        copied = 0
+        skipped = 0
+
+        for src in sources:
+            if src.type != 'MESH':
+                skipped += 1
+                continue
+
+            # Topology check
+            if len(src.data.vertices) != len(target.data.vertices):
+                self.report({'WARNING'},
+                    f"'{src.name}' skipped: vertex count mismatch ({len(src.data.vertices)} vs {len(target.data.vertices)})")
+                skipped += 1
+                continue
+
+            # Copy each vertex group
+            for vg_src in src.vertex_groups:
+
+                # Ensure target has this vertex group
+                if vg_src.name not in target.vertex_groups:
+                    target.vertex_groups.new(name=vg_src.name)
+                vg_tgt = target.vertex_groups[vg_src.name]
+
+                # ---- FIX: CLEAR WEIGHTS MANUALLY ----
+                # Remove membership from ALL vertices
+                for v in target.data.vertices:
+                    try:
+                        vg_tgt.remove([v.index])
+                    except RuntimeError:
+                        pass
+
+                # Now transfer weights
+                for v in src.data.vertices:
+                    try:
+                        w = vg_src.weight(v.index)
+                        vg_tgt.add([v.index], w, 'REPLACE')
+                    except RuntimeError:
+                        # Vertex has no weight → skip
+                        pass
+
+                copied += 1
+
+        self.report({'INFO'}, f"Copied {copied} vertex groups, skipped {skipped}.")
+        return {'FINISHED'}
 
 class ShapekeyTransferOperator(bpy.types.Operator):
     """Transfer non-duplicate shapekeys from selected source objects to the active target object."""
@@ -290,6 +359,7 @@ def register():
     bpy.utils.register_class(ShapekeyTransferPanel)
     bpy.utils.register_class(ShapekeyTransferOperator)
     bpy.utils.register_class(ShapekeyAnimationTransferOperator)
+    bpy.utils.register_class(VertexGroupTransferOperator)
 
 
 def unregister():
@@ -299,6 +369,7 @@ def unregister():
     bpy.utils.unregister_class(ShapekeyTransferPanel)
     bpy.utils.unregister_class(ShapekeyTransferOperator)
     bpy.utils.unregister_class(ShapekeyAnimationTransferOperator)
+    bpy.utils.unregister_class(VertexGroupTransferOperator)
 
 
 if __name__ == "__main__":
