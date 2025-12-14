@@ -2,6 +2,40 @@ import bpy
 import re
 
 
+# ------------------------------------------------------------------------
+# Curve helpers
+# ------------------------------------------------------------------------
+def curves_have_matching_topology(src_curve, tgt_curve):
+    """
+    Curve shapekey data order depends on the spline layout.
+    We require exact matching:
+      - same number of splines
+      - same spline types (BEZIER / NURBS / POLY)
+      - same number of points per spline (bezier_points or points)
+    """
+    src_splines = src_curve.splines
+    tgt_splines = tgt_curve.splines
+
+    if len(src_splines) != len(tgt_splines):
+        return False
+
+    for s_src, s_tgt in zip(src_splines, tgt_splines):
+        if s_src.type != s_tgt.type:
+            return False
+
+        if s_src.type == 'BEZIER':
+            if len(s_src.bezier_points) != len(s_tgt.bezier_points):
+                return False
+        else:
+            if len(s_src.points) != len(s_tgt.points):
+                return False
+
+    return True
+
+
+# ------------------------------------------------------------------------
+# UI
+# ------------------------------------------------------------------------
 class ShapekeyTransferPanel(bpy.types.Panel):
     """UI panel for copying shapekeys and their animation from one or more sources to a single target."""
     bl_label = "Copy Shapekeys"
@@ -14,13 +48,16 @@ class ShapekeyTransferPanel(bpy.types.Panel):
         layout = self.layout
         layout.label(text="Select sources then target and click the button.")
         col = layout.column(align=True)
-        # Add the "Name Only" checkbox
         col.prop(context.scene, "name_only", text="Name Only")
         col.prop(context.scene, "active_only", text="Active Only")
         col.operator("object.shapekey_transfer", text="Copy Shape keys", icon="COPYDOWN")
         col.operator("object.shapekey_animation_transfer", text="Copy Animation", icon="ANIM")
         col.operator("object.vertexgroup_transfer", text="Copy Vertex Groups", icon="GROUP_VERTEX")
 
+
+# ------------------------------------------------------------------------
+# Vertex groups (Mesh only)
+# ------------------------------------------------------------------------
 class VertexGroupTransferOperator(bpy.types.Operator):
     """Copy vertex groups from selected sources to the active target (requires identical topology)."""
     bl_idname = "object.vertexgroup_transfer"
@@ -53,36 +90,30 @@ class VertexGroupTransferOperator(bpy.types.Operator):
                 skipped += 1
                 continue
 
-            # Topology check
             if len(src.data.vertices) != len(target.data.vertices):
                 self.report({'WARNING'},
                     f"'{src.name}' skipped: vertex count mismatch ({len(src.data.vertices)} vs {len(target.data.vertices)})")
                 skipped += 1
                 continue
 
-            # Copy each vertex group
             for vg_src in src.vertex_groups:
-
-                # Ensure target has this vertex group
                 if vg_src.name not in target.vertex_groups:
                     target.vertex_groups.new(name=vg_src.name)
                 vg_tgt = target.vertex_groups[vg_src.name]
 
-                # ---- FIX: CLEAR WEIGHTS MANUALLY ----
-                # Remove membership from ALL vertices
+                # Clear weights
                 for v in target.data.vertices:
                     try:
                         vg_tgt.remove([v.index])
                     except RuntimeError:
                         pass
 
-                # Now transfer weights
+                # Transfer weights
                 for v in src.data.vertices:
                     try:
                         w = vg_src.weight(v.index)
                         vg_tgt.add([v.index], w, 'REPLACE')
                     except RuntimeError:
-                        # Vertex has no weight → skip
                         pass
 
                 copied += 1
@@ -90,6 +121,10 @@ class VertexGroupTransferOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Copied {copied} vertex groups, skipped {skipped}.")
         return {'FINISHED'}
 
+
+# ------------------------------------------------------------------------
+# Shapekey transfer (Mesh + Curve)
+# ------------------------------------------------------------------------
 class ShapekeyTransferOperator(bpy.types.Operator):
     """Transfer non-duplicate shapekeys from selected source objects to the active target object."""
     bl_idname = "object.shapekey_transfer"
@@ -112,27 +147,40 @@ class ShapekeyTransferOperator(bpy.types.Operator):
             self.report({'ERROR'}, "No active (target) object selected.")
             return {'CANCELLED'}
 
+        if target_object.type not in {'MESH', 'CURVE'}:
+            self.report({'ERROR'}, "Target object must be a Mesh or Curve.")
+            return {'CANCELLED'}
+
         sources = [obj for obj in selected_objects if obj != target_object]
         if not sources:
             self.report({'ERROR'}, "No source objects selected.")
             return {'CANCELLED'}
 
-        if target_object.type != 'MESH':
-            self.report({'ERROR'}, "Target object must be a mesh.")
-            return {'CANCELLED'}
-
+        # Ensure Basis exists
         if target_object.data.shape_keys is None:
             target_object.shape_key_add(name="Basis", from_mix=False)
 
         copied_count = 0
         skipped_count = 0
         active_only = context.scene.active_only
-        name_only = context.scene.name_only  # Check the "Name Only" checkbox state
+        name_only = context.scene.name_only
 
         for src in sources:
+            # Require matching object type for shapekey geometry transfer
+            if src.type != target_object.type:
+                self.report({'WARNING'}, f"Source '{src.name}' skipped: type mismatch (need {target_object.type}).")
+                skipped_count += 1
+                continue
+
             if src.data.shape_keys is None:
                 self.report({'WARNING'}, f"Source '{src.name}' has no shape keys. Skipped.")
                 continue
+
+            # Curve topology check (only needed if we will copy deformation)
+            if (target_object.type == 'CURVE') and (not name_only):
+                if not curves_have_matching_topology(src.data, target_object.data):
+                    self.report({'WARNING'}, f"Source '{src.name}' skipped: curve topology mismatch.")
+                    continue
 
             for key in src.data.shape_keys.key_blocks:
                 if key.name == "Basis" or (active_only and key.mute):
@@ -145,21 +193,50 @@ class ShapekeyTransferOperator(bpy.types.Operator):
 
                 try:
                     new_key = target_object.shape_key_add(name=key.name, from_mix=False)
-                    if not name_only:  # Only copy vertex deformations if "Name Only" is unchecked
-                        for v_src, v_tgt in zip(key.data, new_key.data):
-                            v_tgt.co = v_src.co
+
+                    if not name_only:
+                        # Mesh: require identical vertex count
+                        if target_object.type == 'MESH':
+                            if len(key.data) != len(new_key.data):
+                                self.report({'WARNING'},
+                                            f"'{src.name}' key '{key.name}' skipped: vertex count mismatch.")
+                                # Remove the partially created key to avoid confusing results
+                                target_object.shape_key_remove(new_key)
+                                skipped_count += 1
+                                continue
+
+                            for v_src, v_tgt in zip(key.data, new_key.data):
+                                v_tgt.co = v_src.co
+
+                        # Curve: data is flattened points/handles; topology match checked above
+                        elif target_object.type == 'CURVE':
+                            if len(key.data) != len(new_key.data):
+                                self.report({'WARNING'},
+                                            f"'{src.name}' key '{key.name}' skipped: curve key data size mismatch.")
+                                target_object.shape_key_remove(new_key)
+                                skipped_count += 1
+                                continue
+
+                            for p_src, p_tgt in zip(key.data, new_key.data):
+                                p_tgt.co = p_src.co
+
                     copied_count += 1
+
                 except Exception as e:
                     self.report({'WARNING'}, f"Failed to copy shapekey '{key.name}' from '{src.name}': {str(e)}")
                     skipped_count += 1
 
+        # Reset all shapekeys on target
         for key in target_object.data.shape_keys.key_blocks:
             key.value = 0.0
 
-        self.report({'INFO'}, f"Copied {copied_count} shape keys, skipped {skipped_count} duplicates or muted.")
+        self.report({'INFO'}, f"Copied {copied_count} shape keys, skipped {skipped_count} duplicates/muted/mismatched.")
         return {'FINISHED'}
 
 
+# ------------------------------------------------------------------------
+# Shapekey animation transfer (Mesh + Curve)
+# ------------------------------------------------------------------------
 class ShapekeyAnimationTransferOperator(bpy.types.Operator):
     """Copy shapekey animation using Dope Sheet copy-paste, with a fallback to manual transfer."""
     bl_idname = "object.shapekey_animation_transfer"
@@ -178,8 +255,8 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
             return {'CANCELLED'}
 
         target = context.view_layer.objects.active
-        if target is None or target.type != 'MESH':
-            self.report({'ERROR'}, "Active object must be a mesh target.")
+        if target is None or target.type not in {'MESH', 'CURVE'}:
+            self.report({'ERROR'}, "Active object must be a Mesh or Curve target.")
             return {'CANCELLED'}
 
         sources = [obj for obj in selected_objects if obj != target]
@@ -187,18 +264,13 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
             self.report({'ERROR'}, "No source objects selected.")
             return {'CANCELLED'}
 
+        # Ensure Basis exists
         if target.data.shape_keys is None:
             target.shape_key_add(name="Basis", from_mix=False)
         key_tgt = target.data.shape_keys
 
-        for key in key_tgt.key_blocks:
-            if len(key.data) != len(target.data.vertices):
-                self.report({'WARNING'}, f"Shape key '{key.name}' on target has mismatched vertex count. Animation may not work.")
-                continue
-
         if key_tgt.animation_data is None:
             key_tgt.animation_data_create()
-
         if key_tgt.animation_data.action is None:
             key_tgt.animation_data.action = bpy.data.actions.new(name=f"{target.name}_ShapekeyAction")
         action_tgt = key_tgt.animation_data.action
@@ -207,6 +279,7 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
         skipped_curves = 0
         active_only = context.scene.active_only
 
+        # Figure out which shapekeys are animated on sources
         shapekeys_to_animate = set()
         for src in sources:
             key_src = src.data.shape_keys
@@ -221,6 +294,7 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
                     if key_name in key_src.key_blocks and (not active_only or not key_src.key_blocks[key_name].mute):
                         shapekeys_to_animate.add(key_name)
 
+        # Ensure target has an initial keyframe channel for each animated shapekey that exists on target
         for key_name in shapekeys_to_animate:
             if key_name in key_tgt.key_blocks:
                 try:
@@ -235,9 +309,15 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
                 except Exception as e:
                     self.report({'WARNING'}, f"Failed to add initial keyframe for '{key_name}' on target: {str(e)}")
 
+        # --- Dope Sheet copy/paste setup ---
+        if context.area is None:
+            self.report({'ERROR'}, "No active area context. Run from a normal Blender UI area.")
+            return {'CANCELLED'}
+
         original_area_type = context.area.type
         original_space_mode = context.space_data.mode if original_area_type == 'DOPESHEET_EDITOR' else None
         original_frame = context.scene.frame_current
+
         context.area.type = 'DOPESHEET_EDITOR'
         context.space_data.mode = 'DOPESHEET'
         context.space_data.ui_mode = 'SHAPEKEY'
@@ -298,10 +378,16 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
             except Exception as e:
                 self.report({'WARNING'}, f"Failed to paste keyframes to '{target.name}': {str(e)}")
 
-            num_target_keyframes = sum(len(fc.keyframe_points) for fc in key_tgt.animation_data.action.fcurves if fc.data_path.startswith('key_blocks'))
+            num_target_keyframes = sum(
+                len(fc.keyframe_points)
+                for fc in key_tgt.animation_data.action.fcurves
+                if fc.data_path.startswith('key_blocks')
+            )
+
             if paste_success and num_target_keyframes >= num_source_keyframes:
                 copied_curves += len(filtered_fcurves)
             else:
+                # Manual fallback per F-curve
                 for fcurve in filtered_fcurves:
                     match = re.match(r'key_blocks\["(.+?)"\]\.value', fcurve.data_path)
                     if not match:
@@ -324,11 +410,13 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
                         self.report({'WARNING'}, f"Fallback failed for '{fcurve.data_path}' from '{src.name}': {str(e)}")
                         skipped_curves += 1
 
+        # Restore area
         context.area.type = original_area_type
         if original_space_mode:
             context.space_data.mode = original_space_mode
         context.scene.frame_set(original_frame)
 
+        # Nudge update
         for key in key_tgt.key_blocks:
             if key.name == "Basis":
                 continue
@@ -339,23 +427,25 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
         target.update_tag()
         context.scene.frame_set(context.scene.frame_current)
 
-        self.report({'INFO'}, f"Copied {copied_curves} F-curves, skipped {skipped_curves} F-curves due to errors or muted.")
+        self.report({'INFO'}, f"Copied {copied_curves} F-curves, skipped {skipped_curves} due to errors/muted.")
         return {'FINISHED'}
 
 
+# ------------------------------------------------------------------------
+# Register / Unregister
+# ------------------------------------------------------------------------
 def register():
-    # Register the "name_only" property
     bpy.types.Scene.name_only = bpy.props.BoolProperty(
         name="Name Only",
-        description="Create shape keys with names only, without copying vertex deformations",
+        description="Create shape keys with names only, without copying deformation data",
         default=False
     )
-    # Register the "active_only" property
     bpy.types.Scene.active_only = bpy.props.BoolProperty(
         name="Active Only",
         description="Only copy unmuted (active) shape keys and their animations",
         default=False
     )
+
     bpy.utils.register_class(ShapekeyTransferPanel)
     bpy.utils.register_class(ShapekeyTransferOperator)
     bpy.utils.register_class(ShapekeyAnimationTransferOperator)
@@ -363,9 +453,9 @@ def register():
 
 
 def unregister():
-    # Unregister the properties
     del bpy.types.Scene.name_only
     del bpy.types.Scene.active_only
+
     bpy.utils.unregister_class(ShapekeyTransferPanel)
     bpy.utils.unregister_class(ShapekeyTransferOperator)
     bpy.utils.unregister_class(ShapekeyAnimationTransferOperator)
