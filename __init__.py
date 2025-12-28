@@ -46,16 +46,27 @@ class ShapekeyTransferPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Select sources then target and click the button.")
-        col = layout.column(align=True)
+
+        # -------- Copy Shapekeys Section --------
+        box = layout.box()
+        box.label(text="Copy Shapekeys")
+
+        col = box.column(align=True)
+        col.label(text="Select sources then target and click the button.")
         col.prop(context.scene, "name_only", text="Name Only")
         col.prop(context.scene, "active_only", text="Active Only")
         col.operator("object.shapekey_transfer", text="Copy Shape keys", icon="COPYDOWN")
         col.operator("object.shapekey_animation_transfer", text="Copy Animation", icon="ANIM")
         col.operator("object.vertexgroup_transfer", text="Copy Vertex Groups", icon="GROUP_VERTEX")
+
         col.separator()
         col.operator("object.shapekey_zero", text="Set Keys to 0", icon="X")
 
+        # -------- Armature Anim Section --------
+        box2 = layout.box()
+        box2.label(text="Copy Armature Anim")
+        box2.label(text="Armatures need to be identical", icon='INFO')
+        box2.operator("object.copy_armature_anim", text="Copy", icon="ANIM")
 
 # ------------------------------------------------------------------------
 # Vertex groups (Mesh only)
@@ -508,6 +519,83 @@ class ShapekeyZeroOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Reset {reset_count} shapekey values to 0.")
         return {'FINISHED'}
 
+# ------------------------------------------------------------------------
+# Copy Armature Anim
+# ------------------------------------------------------------------------
+
+class ArmatureAnimationCopyOperator(bpy.types.Operator):
+    """Copy armature animation from selected source(s) to the active armature.\nArmatures need to be identical."""
+    bl_idname = "object.copy_armature_anim"
+    bl_label = "Copy"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+
+        if context.mode != 'OBJECT':
+            self.report({'ERROR'}, "Run this in Object Mode.")
+            return {'CANCELLED'}
+
+        selected = [o for o in context.selected_objects if o.type == 'ARMATURE']
+        if len(selected) < 2:
+            self.report({'ERROR'}, "Select at least one source armature and one active target.")
+            return {'CANCELLED'}
+
+        target = context.view_layer.objects.active
+        if target not in selected:
+            self.report({'ERROR'}, "The active object must be the target armature.")
+            return {'CANCELLED'}
+
+        sources = [o for o in selected if o != target]
+
+        # Make sure target has animation data
+        if target.animation_data is None:
+            target.animation_data_create()
+
+        copied_actions = 0
+        copied_strips = 0
+
+        for src in sources:
+
+            if src.animation_data is None:
+                self.report({'WARNING'}, f"{src.name} has no animation data – skipped.")
+                continue
+
+            # --- Copy main Action reference ---
+            if src.animation_data.action:
+                target.animation_data.action = src.animation_data.action
+                copied_actions += 1
+
+            # --- Copy NLA tracks & strips ---
+            if src.animation_data.nla_tracks:
+                # Clear target NLA to prevent duplicates
+                target.animation_data.nla_tracks.clear()
+
+                for track in src.animation_data.nla_tracks:
+                    new_track = target.animation_data.nla_tracks.new()
+                    new_track.name = track.name
+                    new_track.mute = track.mute
+                    new_track.is_solo = track.is_solo
+                    new_track.select = track.select
+
+                    for strip in track.strips:
+                        new_strip = new_track.strips.new(
+                            name=strip.name,
+                            start=strip.frame_start,
+                            action=strip.action
+                        )
+
+                        # Copy basic properties
+                        new_strip.frame_end = strip.frame_end
+                        new_strip.repeat = strip.repeat
+                        new_strip.scale = strip.scale
+                        new_strip.blend_type = strip.blend_type
+                        new_strip.extrapolation = strip.extrapolation
+                        new_strip.use_reverse = strip.use_reverse
+
+                        copied_strips += 1
+
+        self.report({'INFO'}, f"Copied {copied_actions} Actions and {copied_strips} NLA strips.")
+        return {'FINISHED'}
 
 # ------------------------------------------------------------------------
 # Register / Unregister
@@ -529,6 +617,8 @@ def register():
     bpy.utils.register_class(ShapekeyAnimationTransferOperator)
     bpy.utils.register_class(VertexGroupTransferOperator)
     bpy.utils.register_class(ShapekeyZeroOperator)
+    bpy.utils.register_class(ArmatureAnimationCopyOperator)
+
 
 
 def unregister():
@@ -540,6 +630,8 @@ def unregister():
     bpy.utils.unregister_class(ShapekeyAnimationTransferOperator)
     bpy.utils.unregister_class(VertexGroupTransferOperator)
     bpy.utils.unregister_class(ShapekeyZeroOperator)
+    bpy.utils.unregister_class(ArmatureAnimationCopyOperator)
+
 
 
 if __name__ == "__main__":
