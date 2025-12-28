@@ -37,7 +37,6 @@ def curves_have_matching_topology(src_curve, tgt_curve):
 # UI
 # ------------------------------------------------------------------------
 class ShapekeyTransferPanel(bpy.types.Panel):
-    """UI panel for copying shapekeys and their animation from one or more sources to a single target."""
     bl_label = "Copy Shapekeys"
     bl_idname = "PT_ShapekeyTransfer"
     bl_space_type = 'VIEW_3D'
@@ -46,19 +45,30 @@ class ShapekeyTransferPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="Select sources then target and click the button.")
-        col = layout.column(align=True)
+
+        # ---------------------------
+        # SHAPEKEY BOX
+        # ---------------------------
+        sk_box = layout.box()
+        sk_box.label(text="Shapekey Tools")
+
+        col = sk_box.column(align=True)
         col.prop(context.scene, "name_only", text="Name Only")
         col.prop(context.scene, "active_only", text="Active Only")
         col.operator("object.shapekey_transfer", text="Copy Shape keys", icon="COPYDOWN")
         col.operator("object.shapekey_animation_transfer", text="Copy Animation", icon="ANIM")
         col.operator("object.vertexgroup_transfer", text="Copy Vertex Groups", icon="GROUP_VERTEX")
+
         col.separator()
         col.operator("object.shapekey_zero", text="Set Keys to 0", icon="X")
-        box = layout.box()
-        box.label(text="Copy Armature Anim")
-        box.operator("object.copy_armature_anim", text="Copy", icon="ANIM")
 
+        # ---------------------------
+        # ARMATURE ANIM BOX
+        # ---------------------------
+        arm_box = layout.box()
+        arm_box.label(text="Copy Armature Anim")
+        arm_box.label(text="(Armatures must be identical)", icon="INFO")
+        arm_box.operator("object.copy_armature_anim", text="Copy", icon="ANIM")
 
 # ------------------------------------------------------------------------
 # Vertex groups (Mesh only)
@@ -511,85 +521,6 @@ class ShapekeyZeroOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Reset {reset_count} shapekey values to 0.")
         return {'FINISHED'}
 
-# ------------------------------------------------------------------------
-# Assign/Copy Animation
-# ------------------------------------------------------------------------
-
-class ArmatureAnimationCopyOperator(bpy.types.Operator):
-    """Copy armature animation (incl. slot) from selected source to active target"""
-    bl_idname = "object.copy_armature_anim"
-    bl_label = "Copy Armature Anim"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-
-        if context.mode != 'OBJECT':
-            self.report({'ERROR'}, "Must be in Object mode")
-            return {'CANCELLED'}
-
-        target = context.view_layer.objects.active
-        if not target or target.type != 'ARMATURE':
-            self.report({'ERROR'}, "Active object must be an Armature")
-            return {'CANCELLED'}
-
-        # first other selected armature is the source
-        sources = [o for o in context.selected_objects if o != target and o.type == 'ARMATURE']
-        if not sources:
-            self.report({'ERROR'}, "Select a source armature in addition to the target")
-            return {'CANCELLED'}
-
-        src = sources[0]
-
-        if not src.animation_data or not src.animation_data.action:
-            self.report({'ERROR'}, f"Source '{src.name}' has no action")
-            return {'CANCELLED'}
-
-        anim_src = src.animation_data
-        src_action = anim_src.action
-
-        # ----- read source slot info (if using action slots) -----
-        slot_name = None
-        slot_type = 'OBJECT'
-
-        # Blender 4.4+ has animation_data.action_slot and Action.slots
-        if hasattr(anim_src, "action_slot") and anim_src.action_slot:
-            src_slot = anim_src.action_slot
-            slot_name = getattr(src_slot, "name", None)
-            slot_type = getattr(src_slot, "slot_type", 'OBJECT')
-
-        # ----- duplicate action -----
-        new_action = src_action.copy()
-        new_action.name = f"{src_action.name}_COPY"
-
-        # ----- assign to target -----
-        if target.animation_data is None:
-            target.animation_data_create()
-        anim_tgt = target.animation_data
-
-        # always assign the action
-        anim_tgt.action = new_action
-
-        # ----- create / assign slot on the new action (4.4+) -----
-        if hasattr(new_action, "slots") and hasattr(anim_tgt, "action_slot"):
-            # if no slots yet, create one
-            if len(new_action.slots) == 0:
-                new_slot = new_action.slots.new(slot_type, slot_name or target.name)
-            else:
-                # try to reuse a slot with same name, otherwise first
-                new_slot = None
-                if slot_name:
-                    for s in new_action.slots:
-                        if s.name == slot_name:
-                            new_slot = s
-                            break
-                if new_slot is None:
-                    new_slot = new_action.slots[0]
-
-            anim_tgt.action_slot = new_slot
-
-        self.report({'INFO'}, f"Animation copied from '{src.name}' to '{target.name}'")
-        return {'FINISHED'}
-
 
 # ------------------------------------------------------------------------
 # Register / Unregister
@@ -611,7 +542,6 @@ def register():
     bpy.utils.register_class(ShapekeyAnimationTransferOperator)
     bpy.utils.register_class(VertexGroupTransferOperator)
     bpy.utils.register_class(ShapekeyZeroOperator)
-    bpy.utils.register_class(ArmatureAnimationCopyOperator)
 
 
 def unregister():
@@ -623,7 +553,6 @@ def unregister():
     bpy.utils.unregister_class(ShapekeyAnimationTransferOperator)
     bpy.utils.unregister_class(VertexGroupTransferOperator)
     bpy.utils.unregister_class(ShapekeyZeroOperator)
-    bpy.utils.unregister_class(ArmatureAnimationCopyOperator)
 
 
 if __name__ == "__main__":
