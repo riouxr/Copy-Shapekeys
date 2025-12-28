@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "copyshapekeys"
-version = "3.0.0"
+version = "3.1.0"
 name = "ShapeKey Copy"
 tagline = "Copy shapekeys from one mesh to another"
 maintainer = "Blender Bob"

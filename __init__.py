@@ -53,6 +53,8 @@ class ShapekeyTransferPanel(bpy.types.Panel):
         col.operator("object.shapekey_transfer", text="Copy Shape keys", icon="COPYDOWN")
         col.operator("object.shapekey_animation_transfer", text="Copy Animation", icon="ANIM")
         col.operator("object.vertexgroup_transfer", text="Copy Vertex Groups", icon="GROUP_VERTEX")
+        col.separator()
+        col.operator("object.shapekey_zero", text="Set Keys to 0", icon="X")
 
 
 # ------------------------------------------------------------------------
@@ -430,6 +432,82 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Copied {copied_curves} F-curves, skipped {skipped_curves} due to errors/muted.")
         return {'FINISHED'}
 
+class ShapekeyZeroOperator(bpy.types.Operator):
+    """Set all shapekey values on selected objects to 0"""
+    bl_idname = "object.shapekey_zero"
+    bl_label = "Set Keys to 0"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            self.report({'ERROR'}, "Operator must be run in Object mode.")
+            return {'CANCELLED'}
+
+        selected = context.selected_objects
+        if not selected:
+            self.report({'ERROR'}, "Select at least one object.")
+            return {'CANCELLED'}
+
+        reset_count = 0
+
+        for obj in selected:
+            if not hasattr(obj.data, "shape_keys"):
+                continue
+
+            keys = obj.data.shape_keys
+            if not keys:
+                continue
+
+            for kb in keys.key_blocks:
+                # Leave Basis alone
+                if kb.name == "Basis":
+                    continue
+                kb.value = 0.0
+                reset_count += 1
+
+        self.report({'INFO'}, f"Reset {reset_count} shapekey values to 0.")
+        return {'FINISHED'}
+
+# ------------------------------------------------------------------------
+# Sek all shapekey values to 0
+# ------------------------------------------------------------------------
+
+class ShapekeyZeroOperator(bpy.types.Operator):
+    """Set all shapekey values on selected objects to 0"""
+    bl_idname = "object.shapekey_zero"
+    bl_label = "Set Keys to 0"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            self.report({'ERROR'}, "Operator must be run in Object mode.")
+            return {'CANCELLED'}
+
+        selected = context.selected_objects
+        if not selected:
+            self.report({'ERROR'}, "Select at least one object.")
+            return {'CANCELLED'}
+
+        reset_count = 0
+
+        for obj in selected:
+            if not hasattr(obj.data, "shape_keys"):
+                continue
+
+            keys = obj.data.shape_keys
+            if not keys:
+                continue
+
+            for kb in keys.key_blocks:
+                # Leave Basis alone
+                if kb.name == "Basis":
+                    continue
+                kb.value = 0.0
+                reset_count += 1
+
+        self.report({'INFO'}, f"Reset {reset_count} shapekey values to 0.")
+        return {'FINISHED'}
+
 
 # ------------------------------------------------------------------------
 # Register / Unregister
@@ -450,6 +528,7 @@ def register():
     bpy.utils.register_class(ShapekeyTransferOperator)
     bpy.utils.register_class(ShapekeyAnimationTransferOperator)
     bpy.utils.register_class(VertexGroupTransferOperator)
+    bpy.utils.register_class(ShapekeyZeroOperator)
 
 
 def unregister():
@@ -460,6 +539,7 @@ def unregister():
     bpy.utils.unregister_class(ShapekeyTransferOperator)
     bpy.utils.unregister_class(ShapekeyAnimationTransferOperator)
     bpy.utils.unregister_class(VertexGroupTransferOperator)
+    bpy.utils.unregister_class(ShapekeyZeroOperator)
 
 
 if __name__ == "__main__":
