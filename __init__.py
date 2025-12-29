@@ -521,6 +521,80 @@ class ShapekeyZeroOperator(bpy.types.Operator):
         self.report({'INFO'}, f"Reset {reset_count} shapekey values to 0.")
         return {'FINISHED'}
 
+# ------------------------------------------------------------------------
+# Copy Armature Anim
+# ------------------------------------------------------------------------
+
+class ArmatureAnimationCopyOperator(bpy.types.Operator):
+    bl_idname = "object.copy_armature_anim"
+    bl_label = "Copy"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+
+        if context.mode != 'OBJECT':
+            self.report({'ERROR'}, "Run in Object Mode.")
+            return {'CANCELLED'}
+
+        armatures = [o for o in context.selected_objects if o.type == 'ARMATURE']
+        if len(armatures) < 2:
+            self.report({'ERROR'}, "Select sources then the active target.")
+            return {'CANCELLED'}
+
+        target = context.view_layer.objects.active
+        sources = [o for o in armatures if o != target]
+
+        if target.animation_data is None:
+            target.animation_data_create()
+        ad_tgt = target.animation_data
+
+        # remove existing NLA
+        for t in list(ad_tgt.nla_tracks):
+            ad_tgt.nla_tracks.remove(t)
+
+        ad_tgt.action = None
+
+        copied_strips = 0
+
+        print("\n===== ARMATURE COPY DEBUG =====")
+
+        for src in sources:
+            print(f"\nSource: {src.name}")
+
+            ad_src = src.animation_data
+            if not ad_src:
+                print("  NO animation_data")
+                continue
+
+            # Stash slot action if present
+            if ad_src.action:
+                print("  STASHING SLOT ACTION:", ad_src.action.name)
+                new_track = ad_tgt.nla_tracks.new()
+                new_track.name = ad_src.action.name
+                action = ad_src.action
+                start = int(action.frame_range[0])
+                ns = new_track.strips.new(action.name, start, action)
+                ns.frame_end = ns.frame_start + (action.frame_range[1] - action.frame_range[0])
+                copied_strips += 1
+
+            # Copy NLA tracks
+            if ad_src.nla_tracks:
+                for track in ad_src.nla_tracks:
+                    print(f"  TRACK: {track.name}")
+                    new_track = ad_tgt.nla_tracks.new()
+                    new_track.name = track.name
+                    for strip in track.strips:
+                        print(f"    STRIP: {strip.name}  ACTION: {strip.action.name if strip.action else None}")
+                        ns = new_track.strips.new(strip.name, int(strip.frame_start), strip.action)
+                        ns.frame_end = strip.frame_end
+                        copied_strips += 1
+
+        print("===== END DEBUG =====\n")
+
+        context.view_layer.update()
+
+        self.report({'INFO'}, f"Copied {copied_strips} strips. See console for details.")
+        return {'FINISHED'}
 
 # ------------------------------------------------------------------------
 # Register / Unregister
