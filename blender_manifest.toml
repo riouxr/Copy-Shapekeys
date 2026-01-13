@@ -1,12 +1,12 @@
 schema_version = "1.0.0"
 id = "copyshapekeys"
-version = "3.2.5"
+version = "3.4.0"
 name = "ShapeKey Copy"
 tagline = "Copy shapekeys from one mesh to another"
 maintainer = "Blender Bob"
 type = "add-on"
 website = "https://github.com/riouxr/Copy-Shapekeys"
 tags = ["Mesh", "Animation"]
-blender_version_min = "4.2.0"
+blender_version_min = "4.5.0"
 license = ["SPDX:GPL-3.0-or-later"]
 copyright = ["2025 Robert Rioux"]

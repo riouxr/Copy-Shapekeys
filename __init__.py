@@ -3,6 +3,83 @@ import re
 
 
 # ------------------------------------------------------------------------
+# Blender 5.0 Compatibility Helper
+# ------------------------------------------------------------------------
+def get_action_fcurves(action):
+    """
+    Get F-Curves from an action in a version-compatible way.
+    Blender 5.0+ uses a layered animation system with channelbags, while 4.x uses fcurves directly.
+    """
+    if action is None:
+        return []
+    
+    # Blender 4.x - direct fcurves access
+    if hasattr(action, 'fcurves') and not hasattr(action, 'layers'):
+        return action.fcurves
+    
+    # Blender 5.0+ - layered animation system with channelbags
+    # We need to collect fcurves from all layers -> strips -> channelbags -> fcurves
+    fcurves_list = []
+    if hasattr(action, 'layers'):
+        for layer in action.layers:
+            if hasattr(layer, 'strips'):
+                for strip in layer.strips:
+                    # Blender 5.0 uses channelbags
+                    if hasattr(strip, 'channelbags'):
+                        for channelbag in strip.channelbags:
+                            if hasattr(channelbag, 'fcurves'):
+                                fcurves_list.extend(channelbag.fcurves)
+                    # Fallback to direct channelbag
+                    elif hasattr(strip, 'channelbag'):
+                        if hasattr(strip.channelbag, 'fcurves'):
+                            fcurves_list.extend(strip.channelbag.fcurves)
+    
+    return fcurves_list
+
+
+def find_fcurve(action, data_path):
+    """
+    Find an F-Curve by data_path in a version-compatible way.
+    """
+    if action is None:
+        return None
+    
+    # Blender 4.x
+    if hasattr(action, 'fcurves') and hasattr(action.fcurves, 'find'):
+        return action.fcurves.find(data_path)
+    
+    # Blender 5.0+
+    fcurves = get_action_fcurves(action)
+    for fcurve in fcurves:
+        if fcurve.data_path == data_path:
+            return fcurve
+    
+    return None
+
+
+def remove_fcurve(action, fcurve):
+    """
+    Remove an F-Curve from an action in a version-compatible way.
+    """
+    if action is None or fcurve is None:
+        return
+    
+    # Blender 4.x
+    if hasattr(action, 'fcurves') and hasattr(action.fcurves, 'remove'):
+        action.fcurves.remove(fcurve)
+        return
+    
+    # Blender 5.0+ - need to find which strip contains this fcurve
+    if hasattr(action, 'layers'):
+        for layer in action.layers:
+            if hasattr(layer, 'strips'):
+                for strip in layer.strips:
+                    if hasattr(strip, 'fcurves') and fcurve in strip.fcurves:
+                        strip.fcurves.remove(fcurve)
+                        return
+
+
+# ------------------------------------------------------------------------
 # Curve helpers
 # ------------------------------------------------------------------------
 def curves_have_matching_topology(src_curve, tgt_curve):
@@ -171,93 +248,183 @@ class ShapekeyTransferOperator(bpy.types.Operator):
             self.report({'ERROR'}, "No source objects selected.")
             return {'CANCELLED'}
 
-        # Ensure Basis exists
-        if target_object.data.shape_keys is None:
+        name_only = context.scene.name_only
+        active_only = context.scene.active_only
+
+        is_curve = (target_object.type == 'CURVE')
+        target_data = target_object.data
+
+        # Validate curve topology if target is a curve
+        if is_curve:
+            for src in sources:
+                if src.type != 'CURVE':
+                    self.report({'ERROR'}, f"'{src.name}' is not a curve but target is a curve.")
+                    return {'CANCELLED'}
+                if not curves_have_matching_topology(src.data, target_data):
+                    self.report({'ERROR'},
+                        f"'{src.name}' does not have the same spline structure as target '{target_object.name}'.")
+                    return {'CANCELLED'}
+        else:
+            # Mesh: vertex count check
+            target_vert_count = len(target_data.vertices)
+            for src in sources:
+                if src.type != 'MESH':
+                    self.report({'ERROR'}, f"'{src.name}' is not a mesh but target is a mesh.")
+                    return {'CANCELLED'}
+                if len(src.data.vertices) != target_vert_count:
+                    self.report({'ERROR'},
+                        f"'{src.name}' has a different vertex count ({len(src.data.vertices)} vs {target_vert_count}).")
+                    return {'CANCELLED'}
+
+        # Create Basis if missing
+        if target_data.shape_keys is None:
             target_object.shape_key_add(name="Basis", from_mix=False)
 
+        target_keys = target_data.shape_keys
         copied_count = 0
-        skipped_count = 0
-        active_only = context.scene.active_only
-        name_only = context.scene.name_only
 
-        for src in sources:
-            # Require matching object type for shapekey geometry transfer
-            if src.type != target_object.type:
-                self.report({'WARNING'}, f"Source '{src.name}' skipped: type mismatch (need {target_object.type}).")
-                skipped_count += 1
+        for src_object in sources:
+            src_data = src_object.data
+            if src_data.shape_keys is None:
+                self.report({'WARNING'}, f"'{src_object.name}' has no shapekeys.")
                 continue
 
-            if src.data.shape_keys is None:
-                self.report({'WARNING'}, f"Source '{src.name}' has no shape keys. Skipped.")
-                continue
+            src_keys = src_data.shape_keys
 
-            # Curve topology check (only needed if we will copy deformation)
-            if (target_object.type == 'CURVE') and (not name_only):
-                if not curves_have_matching_topology(src.data, target_object.data):
-                    self.report({'WARNING'}, f"Source '{src.name}' skipped: curve topology mismatch.")
+            for src_block in src_keys.key_blocks:
+                if src_block.name == "Basis":
+                    continue
+                if active_only and src_block.mute:
                     continue
 
-            for key in src.data.shape_keys.key_blocks:
-                if key.name == "Basis" or (active_only and key.mute):
-                    skipped_count += 1
+                # Skip if already exists
+                if src_block.name in target_keys.key_blocks:
                     continue
 
-                if key.name in target_object.data.shape_keys.key_blocks:
-                    skipped_count += 1
-                    continue
+                # Create shapekey on target
+                new_block = target_object.shape_key_add(name=src_block.name, from_mix=False)
 
-                try:
-                    new_key = target_object.shape_key_add(name=key.name, from_mix=False)
+                # Copy properties
+                new_block.slider_min = src_block.slider_min
+                new_block.slider_max = src_block.slider_max
+                new_block.value = src_block.value
+                new_block.mute = src_block.mute
 
-                    if not name_only:
-                        # Mesh: require identical vertex count
-                        if target_object.type == 'MESH':
-                            if len(key.data) != len(new_key.data):
-                                self.report({'WARNING'},
-                                            f"'{src.name}' key '{key.name}' skipped: vertex count mismatch.")
-                                # Remove the partially created key to avoid confusing results
-                                target_object.shape_key_remove(new_key)
-                                skipped_count += 1
-                                continue
+                # Copy deformation data if not name-only
+                if not name_only:
+                    if is_curve:
+                        # Curve
+                        for s_src, s_tgt in zip(src_data.splines, target_data.splines):
+                            if s_src.type == 'BEZIER':
+                                for pt_src, pt_tgt in zip(s_src.bezier_points, s_tgt.bezier_points):
+                                    pt_idx = pt_src.index if hasattr(pt_src, 'index') else pt_tgt.index
+                                    new_block.data[pt_idx].co = src_block.data[pt_idx].co
+                                    new_block.data[pt_idx].handle_left = src_block.data[pt_idx].handle_left
+                                    new_block.data[pt_idx].handle_right = src_block.data[pt_idx].handle_right
+                            else:
+                                for pt_src, pt_tgt in zip(s_src.points, s_tgt.points):
+                                    pt_idx = pt_src.index if hasattr(pt_src, 'index') else pt_tgt.index
+                                    new_block.data[pt_idx].co = src_block.data[pt_idx].co
+                    else:
+                        # Mesh
+                        for i, vert in enumerate(src_block.data):
+                            new_block.data[i].co = vert.co
 
-                            for v_src, v_tgt in zip(key.data, new_key.data):
-                                v_tgt.co = v_src.co
+                copied_count += 1
 
-                        # Curve: data is flattened points/handles; topology match checked above
-                        elif target_object.type == 'CURVE':
-                            if len(key.data) != len(new_key.data):
-                                self.report({'WARNING'},
-                                            f"'{src.name}' key '{key.name}' skipped: curve key data size mismatch.")
-                                target_object.shape_key_remove(new_key)
-                                skipped_count += 1
-                                continue
-
-                            for p_src, p_tgt in zip(key.data, new_key.data):
-                                p_tgt.co = p_src.co
-
-                    copied_count += 1
-
-                except Exception as e:
-                    self.report({'WARNING'}, f"Failed to copy shapekey '{key.name}' from '{src.name}': {str(e)}")
-                    skipped_count += 1
-
-        # Reset all shapekeys on target
-        for key in target_object.data.shape_keys.key_blocks:
-            key.value = 0.0
-
-        self.report({'INFO'}, f"Copied {copied_count} shape keys, skipped {skipped_count} duplicates/muted/mismatched.")
+        self.report({'INFO'}, f"Copied {copied_count} shapekey(s) to '{target_object.name}'.")
         return {'FINISHED'}
 
 
 # ------------------------------------------------------------------------
-# Shapekey animation transfer (Mesh + Curve)
+# Shapekey Animation Transfer
 # ------------------------------------------------------------------------
 class ShapekeyAnimationTransferOperator(bpy.types.Operator):
-    """Copy shapekey animation using Dope Sheet copy-paste, with a fallback to manual transfer."""
+    """Copy shapekey animation from selected sources to the active target."""
     bl_idname = "object.shapekey_animation_transfer"
-    bl_label = "Transfer Shapekey Animation"
-    bl_description = "Copy shapekey animation curves from selected source objects to the active target object"
+    bl_label = "Copy Shapekey Animation"
+    bl_description = "Copy shapekey animation from selected sources to active target"
     bl_options = {'REGISTER', 'UNDO'}
+
+    def copy_fcurve_keyframes(self, src_fcurve, tgt_fcurve):
+        """Copy all keyframes from source fcurve to target fcurve."""
+        # Clear existing keyframes
+        while len(tgt_fcurve.keyframe_points) > 0:
+            tgt_fcurve.keyframe_points.remove(tgt_fcurve.keyframe_points[0])
+        
+        # Copy each keyframe
+        for kf in src_fcurve.keyframe_points:
+            new_kf = tgt_fcurve.keyframe_points.insert(kf.co.x, kf.co.y)
+            new_kf.interpolation = kf.interpolation
+            new_kf.handle_left_type = kf.handle_left_type
+            new_kf.handle_right_type = kf.handle_right_type
+            new_kf.handle_left = kf.handle_left
+            new_kf.handle_right = kf.handle_right
+        
+        # Copy fcurve properties
+        tgt_fcurve.extrapolation = src_fcurve.extrapolation
+        tgt_fcurve.color_mode = src_fcurve.color_mode
+        tgt_fcurve.color = src_fcurve.color
+
+    def get_or_create_fcurve(self, action, data_path, array_index=0):
+        """Get existing fcurve or create a new one - compatible with Blender 4.x and 5.0+"""
+        # Try to find existing fcurve
+        fcurves = get_action_fcurves(action)
+        for fc in fcurves:
+            if fc.data_path == data_path and fc.array_index == array_index:
+                return fc
+        
+        # Need to create new fcurve
+        # Blender 4.x - has fcurves.new() directly
+        if hasattr(action, 'fcurves') and hasattr(action.fcurves, 'new'):
+            return action.fcurves.new(data_path, index=array_index)
+        
+        # Blender 5.0+ - need to use layers/strips/channelbags
+        if hasattr(action, 'layers'):
+            # Get or create a layer
+            if len(action.layers) == 0:
+                layer = action.layers.new(name="Layer")
+            else:
+                layer = action.layers[0]
+            
+            # Get or create a keyframe strip
+            if hasattr(layer, 'strips'):
+                if len(layer.strips) == 0:
+                    if hasattr(layer.strips, 'new'):
+                        try:
+                            strip = layer.strips.new()
+                        except Exception as e:
+                            return None
+                    else:
+                        return None
+                else:
+                    strip = layer.strips[0]
+                
+                # Create fcurve in a channelbag
+                channelbag = None
+                if hasattr(strip, 'channelbags'):
+                    if len(strip.channelbags) > 0:
+                        channelbag = strip.channelbags[0]
+                    elif hasattr(strip.channelbags, 'new'):
+                        try:
+                            channelbag = strip.channelbags.new()
+                        except Exception as e:
+                            return None
+                elif hasattr(strip, 'channelbag'):
+                    channelbag = strip.channelbag
+                
+                if channelbag and hasattr(channelbag, 'fcurves') and hasattr(channelbag.fcurves, 'new'):
+                    try:
+                        new_fc = channelbag.fcurves.new(data_path, index=array_index)
+                        return new_fc
+                    except Exception as e:
+                        return None
+                else:
+                    return None
+            else:
+                return None
+        
+        return None
 
     def execute(self, context):
         if context.mode != 'OBJECT':
@@ -266,17 +433,25 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
 
         selected_objects = context.selected_objects
         if len(selected_objects) < 2:
-            self.report({'ERROR'}, "Select at least one source and one target (active).")
+            self.report({'ERROR'}, "Select at least one source object and one target object (active).")
             return {'CANCELLED'}
 
         target = context.view_layer.objects.active
-        if target is None or target.type not in {'MESH', 'CURVE'}:
-            self.report({'ERROR'}, "Active object must be a Mesh or Curve target.")
+        if target is None:
+            self.report({'ERROR'}, "No active (target) object selected.")
             return {'CANCELLED'}
 
-        sources = [obj for obj in selected_objects if obj != target]
+        if target.type not in {'MESH', 'CURVE'}:
+            self.report({'ERROR'}, "Target must be a Mesh or Curve.")
+            return {'CANCELLED'}
+
+        if target.data.shape_keys is None:
+            self.report({'ERROR'}, "Target has no shapekeys. Copy shapekeys first.")
+            return {'CANCELLED'}
+
+        sources = [obj for obj in selected_objects if obj != target and obj.type in {'MESH', 'CURVE'}]
         if not sources:
-            self.report({'ERROR'}, "No source objects selected.")
+            self.report({'ERROR'}, "No valid source objects selected.")
             return {'CANCELLED'}
 
         # Ensure Basis exists
@@ -294,161 +469,79 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
         skipped_curves = 0
         active_only = context.scene.active_only
 
-        # Figure out which shapekeys are animated on sources
-        shapekeys_to_animate = set()
-        for src in sources:
-            key_src = src.data.shape_keys
-            if key_src is None or key_src.animation_data is None or key_src.animation_data.action is None:
-                continue
-            for fcurve in key_src.animation_data.action.fcurves:
-                if not fcurve.data_path.startswith('key_blocks'):
-                    continue
-                match = re.match(r'key_blocks\["(.+?)"\]\.value', fcurve.data_path)
-                if match:
-                    key_name = match.group(1)
-                    if key_name in key_src.key_blocks and (not active_only or not key_src.key_blocks[key_name].mute):
-                        shapekeys_to_animate.add(key_name)
-
-        # Ensure target has an initial keyframe channel for each animated shapekey that exists on target
-        for key_name in shapekeys_to_animate:
-            if key_name in key_tgt.key_blocks:
-                try:
-                    data_path = f'key_blocks["{key_name}"].value'
-                    existing_fcurve = action_tgt.fcurves.find(data_path)
-                    if existing_fcurve:
-                        action_tgt.fcurves.remove(existing_fcurve)
-
-                    current_frame = context.scene.frame_current
-                    key_tgt.key_blocks[key_name].value = 0.0
-                    key_tgt.key_blocks[key_name].keyframe_insert(data_path="value", frame=current_frame)
-                except Exception as e:
-                    self.report({'WARNING'}, f"Failed to add initial keyframe for '{key_name}' on target: {str(e)}")
-
-        # --- Dope Sheet copy/paste setup ---
-        if context.area is None:
-            self.report({'ERROR'}, "No active area context. Run from a normal Blender UI area.")
-            return {'CANCELLED'}
-
-        original_area_type = context.area.type
-        original_space_mode = context.space_data.mode if original_area_type == 'DOPESHEET_EDITOR' else None
-        original_frame = context.scene.frame_current
-
-        context.area.type = 'DOPESHEET_EDITOR'
-        context.space_data.mode = 'DOPESHEET'
-        context.space_data.ui_mode = 'SHAPEKEY'
-        context.space_data.dopesheet.show_only_selected = True
-        context.space_data.dopesheet.show_hidden = False
-
         for src in sources:
             key_src = src.data.shape_keys
             if key_src is None:
-                self.report({'WARNING'}, f"Source '{src.name}' has no shapekeys. Skipped.")
                 continue
             if key_src.animation_data is None or key_src.animation_data.action is None:
-                self.report({'WARNING'}, f"Source '{src.name}' has no shapekey animation. Skipped.")
-                continue
-            if not any(fcurve.data_path.startswith('key_blocks') for fcurve in key_src.animation_data.action.fcurves):
-                self.report({'WARNING'}, f"Source '{src.name}' has no shapekey F-curves. Skipped.")
                 continue
 
-            filtered_fcurves = []
-            for fcurve in key_src.animation_data.action.fcurves:
-                if not fcurve.data_path.startswith('key_blocks'):
+            action_src = key_src.animation_data.action
+            
+            # Get all fcurves from source
+            src_fcurves = get_action_fcurves(action_src)
+
+            for src_fcurve in src_fcurves:
+                # Only process shapekey fcurves
+                if not src_fcurve.data_path.startswith('key_blocks'):
                     continue
-                match = re.match(r'key_blocks\["(.+?)"\]\.value', fcurve.data_path)
-                if match:
-                    key_name = match.group(1)
-                    if key_name in key_src.key_blocks and (not active_only or not key_src.key_blocks[key_name].mute):
-                        filtered_fcurves.append(fcurve)
 
-            if not filtered_fcurves:
-                self.report({'WARNING'}, f"No unmuted shapekey F-curves to copy from '{src.name}'. Skipped.")
-                continue
+                # Extract shapekey name
+                match = re.match(r'key_blocks\["(.+?)"\]\.value', src_fcurve.data_path)
+                if not match:
+                    continue
 
-            bpy.ops.object.select_all(action='DESELECT')
-            src.select_set(True)
-            context.view_layer.objects.active = src
+                key_name = match.group(1)
 
-            try:
-                bpy.ops.anim.channels_select_all(action='DESELECT')
-                for fcurve in filtered_fcurves:
-                    fcurve.select = True
-                bpy.ops.action.copy()
-            except Exception as e:
-                self.report({'WARNING'}, f"Failed to copy keyframes from '{src.name}': {str(e)}")
-                continue
+                # Check if key exists in source
+                if key_name not in key_src.key_blocks:
+                    skipped_curves += 1
+                    continue
 
-            src.select_set(False)
-            target.select_set(True)
-            context.view_layer.objects.active = target
+                # Skip if active_only and key is muted
+                if active_only and key_src.key_blocks[key_name].mute:
+                    skipped_curves += 1
+                    continue
 
-            context.scene.frame_set(0)
+                # Check if key exists in target
+                if key_name not in key_tgt.key_blocks:
+                    skipped_curves += 1
+                    continue
 
-            paste_success = False
-            num_source_keyframes = sum(len(fc.keyframe_points) for fc in filtered_fcurves)
-            try:
-                bpy.ops.anim.channels_select_all(action='DESELECT')
-                bpy.ops.action.paste(offset=0, merge="OVERWRITE")
-                paste_success = True
-            except Exception as e:
-                self.report({'WARNING'}, f"Failed to paste keyframes to '{target.name}': {str(e)}")
+                # Get or create target fcurve
+                data_path = f'key_blocks["{key_name}"].value'
+                tgt_fcurve = self.get_or_create_fcurve(action_tgt, data_path, src_fcurve.array_index)
+                
+                if tgt_fcurve is None:
+                    skipped_curves += 1
+                    continue
 
-            num_target_keyframes = sum(
-                len(fc.keyframe_points)
-                for fc in key_tgt.animation_data.action.fcurves
-                if fc.data_path.startswith('key_blocks')
-            )
+                # Copy keyframes
+                try:
+                    self.copy_fcurve_keyframes(src_fcurve, tgt_fcurve)
+                    copied_curves += 1
+                except Exception as e:
+                    skipped_curves += 1
 
-            if paste_success and num_target_keyframes >= num_source_keyframes:
-                copied_curves += len(filtered_fcurves)
-            else:
-                # Manual fallback per F-curve
-                for fcurve in filtered_fcurves:
-                    match = re.match(r'key_blocks\["(.+?)"\]\.value', fcurve.data_path)
-                    if not match:
-                        continue
-                    key_name = match.group(1)
-                    if key_name not in key_tgt.key_blocks:
-                        continue
+        # Update scene
+        context.view_layer.update()
 
-                    existing_fcurve = action_tgt.fcurves.find(fcurve.data_path, index=fcurve.array_index)
-                    if existing_fcurve:
-                        action_tgt.fcurves.remove(existing_fcurve)
-
-                    try:
-                        for kp in fcurve.keyframe_points:
-                            frame, value = kp.co
-                            key_tgt.key_blocks[key_name].value = value
-                            key_tgt.key_blocks[key_name].keyframe_insert(data_path="value", frame=frame)
-                        copied_curves += 1
-                    except Exception as e:
-                        self.report({'WARNING'}, f"Fallback failed for '{fcurve.data_path}' from '{src.name}': {str(e)}")
-                        skipped_curves += 1
-
-        # Restore area
-        context.area.type = original_area_type
-        if original_space_mode:
-            context.space_data.mode = original_space_mode
-        context.scene.frame_set(original_frame)
-
-        # Nudge update
-        for key in key_tgt.key_blocks:
-            if key.name == "Basis":
-                continue
-            original_value = key.value
-            key.value = 1.0 if original_value != 1.0 else 0.0
-            key.value = original_value
-
-        target.update_tag()
-        context.scene.frame_set(context.scene.frame_current)
-
-        self.report({'INFO'}, f"Copied {copied_curves} F-curves, skipped {skipped_curves} due to errors/muted.")
+        if copied_curves > 0:
+            self.report({'INFO'}, f"Copied {copied_curves} animation curves, skipped {skipped_curves}.")
+        else:
+            self.report({'WARNING'}, f"No animation curves copied. Skipped {skipped_curves}.")
+        
         return {'FINISHED'}
 
+
+# ------------------------------------------------------------------------
+# Zero All Shapekeys
+# ------------------------------------------------------------------------
 class ShapekeyZeroOperator(bpy.types.Operator):
-    """Set all shapekey values on selected objects to 0"""
+    """Set the value of all shape keys on the selected object to 0 (except Basis)."""
     bl_idname = "object.shapekey_zero"
-    bl_label = "Set Keys to 0"
+    bl_label = "Zero All Shapekeys"
+    bl_description = "Set all shapekey values to 0 for the selected object"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -456,152 +549,93 @@ class ShapekeyZeroOperator(bpy.types.Operator):
             self.report({'ERROR'}, "Operator must be run in Object mode.")
             return {'CANCELLED'}
 
-        selected = context.selected_objects
-        if not selected:
-            self.report({'ERROR'}, "Select at least one object.")
+        obj = context.view_layer.objects.active
+        if obj is None:
+            self.report({'ERROR'}, "No active object selected.")
             return {'CANCELLED'}
 
-        reset_count = 0
+        if obj.type not in {'MESH', 'CURVE'}:
+            self.report({'ERROR'}, "Active object must be a Mesh or Curve.")
+            return {'CANCELLED'}
 
-        for obj in selected:
-            if not hasattr(obj.data, "shape_keys"):
+        if obj.data.shape_keys is None:
+            self.report({'WARNING'}, "Active object has no shapekeys.")
+            return {'CANCELLED'}
+
+        count = 0
+        for block in obj.data.shape_keys.key_blocks:
+            if block.name == "Basis":
                 continue
+            block.value = 0.0
+            count += 1
 
-            keys = obj.data.shape_keys
-            if not keys:
-                continue
-
-            for kb in keys.key_blocks:
-                # Leave Basis alone
-                if kb.name == "Basis":
-                    continue
-                kb.value = 0.0
-                reset_count += 1
-
-        self.report({'INFO'}, f"Reset {reset_count} shapekey values to 0.")
+        self.report({'INFO'}, f"Set {count} shapekey(s) to 0.")
         return {'FINISHED'}
 
-# ------------------------------------------------------------------------
-# Copy Armature Anim
-# ------------------------------------------------------------------------
 
+# ------------------------------------------------------------------------
+# Copy Armature Animation
+# ------------------------------------------------------------------------
 class ArmatureAnimationCopyOperator(bpy.types.Operator):
+    """Copy armature animation from selected sources to active target (armatures must be identical)."""
     bl_idname = "object.copy_armature_anim"
-    bl_label = "Copy"
+    bl_label = "Copy Armature Animation"
+    bl_description = "Copy armature animation from selected sources to active target"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-
         if context.mode != 'OBJECT':
-            self.report({'ERROR'}, "Run in Object Mode.")
+            self.report({'ERROR'}, "Operator must be run in Object mode.")
             return {'CANCELLED'}
 
-        armatures = [o for o in context.selected_objects if o.type == 'ARMATURE']
-        if len(armatures) < 2:
-            self.report({'ERROR'}, "Select sources then the active target.")
+        selected_objects = context.selected_objects
+        if len(selected_objects) < 2:
+            self.report({'ERROR'}, "Select at least one source armature and one target armature (active).")
             return {'CANCELLED'}
 
         target = context.view_layer.objects.active
-        sources = [o for o in armatures if o != target]
+        if target is None:
+            self.report({'ERROR'}, "No active (target) object selected.")
+            return {'CANCELLED'}
 
-        print("\n===== ARMATURE VERIFICATION =====")
-        
-        # Verify armatures are identical
-        for src in sources:
-            print(f"\nComparing {src.name} -> {target.name}")
-            
-            src_bones = src.data.bones
-            tgt_bones = target.data.bones
-            
-            # Check bone count
-            if len(src_bones) != len(tgt_bones):
-                msg = f"Bone count mismatch: {src.name} has {len(src_bones)} bones, {target.name} has {len(tgt_bones)} bones"
-                print(f"  ✗ {msg}")
-                self.report({'ERROR'}, msg)
-                return {'CANCELLED'}
-            
-            print(f"  ✓ Both have {len(src_bones)} bones")
-            
-            # Get bone names
-            src_bone_names = set(bone.name for bone in src_bones)
-            tgt_bone_names = set(bone.name for bone in tgt_bones)
-            
-            # Check for name mismatches
-            missing_in_target = src_bone_names - tgt_bone_names
-            extra_in_target = tgt_bone_names - src_bone_names
-            
-            if missing_in_target or extra_in_target:
-                print(f"  ✗ Bone name mismatch:")
-                if missing_in_target:
-                    print(f"    Missing in target: {', '.join(sorted(missing_in_target))}")
-                if extra_in_target:
-                    print(f"    Extra in target: {', '.join(sorted(extra_in_target))}")
-                
-                self.report({'ERROR'}, f"Bone names don't match between {src.name} and {target.name}. See console.")
-                return {'CANCELLED'}
-            
-            print(f"  ✓ All bone names match")
-            
-            # Check bone hierarchy
-            hierarchy_mismatch = False
-            for bone_name in src_bone_names:
-                src_bone = src_bones[bone_name]
-                tgt_bone = tgt_bones[bone_name]
-                
-                src_parent_name = src_bone.parent.name if src_bone.parent else None
-                tgt_parent_name = tgt_bone.parent.name if tgt_bone.parent else None
-                
-                if src_parent_name != tgt_parent_name:
-                    print(f"  ✗ Bone '{bone_name}' parent mismatch: '{src_parent_name}' vs '{tgt_parent_name}'")
-                    hierarchy_mismatch = True
-            
-            if hierarchy_mismatch:
-                self.report({'ERROR'}, f"Bone hierarchy doesn't match between {src.name} and {target.name}. See console.")
-                return {'CANCELLED'}
-            
-            print(f"  ✓ Bone hierarchy matches")
-            
-            # Check armature data names (this is often the issue!)
-            print(f"  Armature data IDs:")
-            print(f"    Source: {src.data.name}")
-            print(f"    Target: {target.data.name}")
-            
-            if src.data.name != target.data.name:
-                print(f"  ⚠ Warning: Armature data names differ - this may cause animation issues!")
-            
-        print("===== ARMATURE STRUCTURES VERIFIED =====\n")
+        if target.type != 'ARMATURE':
+            self.report({'ERROR'}, "Target must be an armature.")
+            return {'CANCELLED'}
+
+        sources = [obj for obj in selected_objects if obj != target and obj.type == 'ARMATURE']
+        if not sources:
+            self.report({'ERROR'}, "No source armature objects selected.")
+            return {'CANCELLED'}
 
         if target.animation_data is None:
             target.animation_data_create()
+
         ad_tgt = target.animation_data
-
-        # remove existing NLA
-        for t in list(ad_tgt.nla_tracks):
-            ad_tgt.nla_tracks.remove(t)
-
-        ad_tgt.action = None
-
         copied_strips = 0
         slot_action_assigned = False
 
-        print("\n===== ARMATURE COPY DEBUG =====")
+        print("\n===== BEGIN DEBUG: COPY ARMATURE ANIMATION =====")
+        print(f"TARGET: {target.name}")
+        print(f"SOURCES: {[s.name for s in sources]}")
 
         for src in sources:
-            print(f"\nSource: {src.name}")
-
-            ad_src = src.animation_data
-            if not ad_src:
-                print("  NO animation_data")
+            print(f"\n--- Processing source: {src.name} ---")
+            
+            if src.animation_data is None:
+                print(f"  ✗ No animation_data on source '{src.name}'")
                 continue
 
-            # Assign slot action if present (only assign the first one found)
-            if ad_src.action and not slot_action_assigned:
-                print("  COPYING AND ASSIGNING SLOT ACTION:", ad_src.action.name)
+            ad_src = src.animation_data
+            print(f"  ✓ Source has animation_data")
+
+            # Copy the action if present
+            if ad_src.action:
                 src_action = ad_src.action
+                print(f"  ACTION: {src_action.name}")
                 
-                # Diagnose the action structure (Blender 5.0+ has layers, older has fcurves)
+                # Debug: Show action structure
                 if hasattr(src_action, 'layers'):
-                    print(f"    Action has {len(src_action.layers)} layer(s) (Blender 5.0+ animation system)")
+                    print(f"    Action has {len(src_action.layers)} layer(s) (Blender 5.0+ layered system)")
                     for i, layer in enumerate(src_action.layers):
                         print(f"      Layer {i}: {layer.name} with {len(layer.strips)} strip(s)")
                 elif hasattr(src_action, 'fcurves'):
