@@ -13,28 +13,21 @@ def get_action_fcurves(action):
     if action is None:
         return []
     
+    # Blender 5.0+ has a layered animation system
+    # Check for layers first, as 5.0 may have both 'layers' and 'fcurves' attributes
+    if hasattr(action, 'layers') and len(action.layers) > 0:
+        fcurves_list = []
+        for layer in action.layers:
+            for strip in layer.strips:
+                for channelbag in strip.channelbags:
+                    fcurves_list.extend(channelbag.fcurves)
+        return fcurves_list
+    
     # Blender 4.x - direct fcurves access
-    if hasattr(action, 'fcurves') and not hasattr(action, 'layers'):
+    if hasattr(action, 'fcurves'):
         return action.fcurves
     
-    # Blender 5.0+ - layered animation system with channelbags
-    # We need to collect fcurves from all layers -> strips -> channelbags -> fcurves
-    fcurves_list = []
-    if hasattr(action, 'layers'):
-        for layer in action.layers:
-            if hasattr(layer, 'strips'):
-                for strip in layer.strips:
-                    # Blender 5.0 uses channelbags
-                    if hasattr(strip, 'channelbags'):
-                        for channelbag in strip.channelbags:
-                            if hasattr(channelbag, 'fcurves'):
-                                fcurves_list.extend(channelbag.fcurves)
-                    # Fallback to direct channelbag
-                    elif hasattr(strip, 'channelbag'):
-                        if hasattr(strip.channelbag, 'fcurves'):
-                            fcurves_list.extend(strip.channelbag.fcurves)
-    
-    return fcurves_list
+    return []
 
 
 def find_fcurve(action, data_path):
@@ -44,11 +37,7 @@ def find_fcurve(action, data_path):
     if action is None:
         return None
     
-    # Blender 4.x
-    if hasattr(action, 'fcurves') and hasattr(action.fcurves, 'find'):
-        return action.fcurves.find(data_path)
-    
-    # Blender 5.0+
+    # Use get_action_fcurves which already handles version detection
     fcurves = get_action_fcurves(action)
     for fcurve in fcurves:
         if fcurve.data_path == data_path:
@@ -366,7 +355,7 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
         tgt_fcurve.color_mode = src_fcurve.color_mode
         tgt_fcurve.color = src_fcurve.color
 
-    def get_or_create_fcurve(self, action, data_path, array_index=0):
+    def get_or_create_fcurve(self, action, data_path, array_index=0, target_data=None):
         """Get existing fcurve or create a new one - compatible with Blender 4.x and 5.0+"""
         # Try to find existing fcurve
         fcurves = get_action_fcurves(action)
@@ -375,11 +364,7 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
                 return fc
         
         # Need to create new fcurve
-        # Blender 4.x - has fcurves.new() directly
-        if hasattr(action, 'fcurves') and hasattr(action.fcurves, 'new'):
-            return action.fcurves.new(data_path, index=array_index)
-        
-        # Blender 5.0+ - need to use layers/strips/channelbags
+        # Blender 5.0+ - check for layers first (5.0 has both layers and fcurves attributes)
         if hasattr(action, 'layers'):
             # Get or create a layer
             if len(action.layers) == 0:
@@ -388,41 +373,32 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
                 layer = action.layers[0]
             
             # Get or create a keyframe strip
-            if hasattr(layer, 'strips'):
-                if len(layer.strips) == 0:
-                    if hasattr(layer.strips, 'new'):
-                        try:
-                            strip = layer.strips.new()
-                        except Exception as e:
-                            return None
-                    else:
-                        return None
-                else:
-                    strip = layer.strips[0]
-                
-                # Create fcurve in a channelbag
-                channelbag = None
-                if hasattr(strip, 'channelbags'):
-                    if len(strip.channelbags) > 0:
-                        channelbag = strip.channelbags[0]
-                    elif hasattr(strip.channelbags, 'new'):
-                        try:
-                            channelbag = strip.channelbags.new()
-                        except Exception as e:
-                            return None
-                elif hasattr(strip, 'channelbag'):
-                    channelbag = strip.channelbag
-                
-                if channelbag and hasattr(channelbag, 'fcurves') and hasattr(channelbag.fcurves, 'new'):
-                    try:
-                        new_fc = channelbag.fcurves.new(data_path, index=array_index)
-                        return new_fc
-                    except Exception as e:
-                        return None
-                else:
-                    return None
+            if len(layer.strips) == 0:
+                strip = layer.strips.new(type='KEYFRAME')
             else:
-                return None
+                strip = layer.strips[0]
+            
+            # Get or create channelbag (requires a slot in Blender 5.0)
+            if len(strip.channelbags) > 0:
+                channelbag = strip.channelbags[0]
+            else:
+                # Need to create a slot for the channelbag
+                if len(action.slots) == 0:
+                    # For shape keys, use 'KEY' id_type
+                    # Use target_data name if available, otherwise use a default name
+                    slot_name = target_data.name if (target_data and hasattr(target_data, 'name')) else "ShapeKeys"
+                    slot = action.slots.new(name=slot_name, id_type='KEY')
+                else:
+                    slot = action.slots[0]
+                
+                channelbag = strip.channelbags.new(slot)
+            
+            # Create the fcurve in the channelbag
+            return channelbag.fcurves.new(data_path, index=array_index)
+        
+        # Blender 4.x - direct fcurves access
+        if hasattr(action, 'fcurves'):
+            return action.fcurves.new(data_path, index=array_index)
         
         return None
 
@@ -464,6 +440,19 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
         if key_tgt.animation_data.action is None:
             key_tgt.animation_data.action = bpy.data.actions.new(name=f"{target.name}_ShapekeyAction")
         action_tgt = key_tgt.animation_data.action
+        
+        # For Blender 5.0, ensure the action is properly assigned to the shape_keys
+        # by setting the action_slot_handle if it exists
+        if hasattr(action_tgt, 'slots') and len(action_tgt.slots) > 0:
+            if hasattr(key_tgt.animation_data, 'action_slot_handle'):
+                # Get the first slot's handle (will be created by get_or_create_fcurve if needed)
+                # We'll set this after creating the first fcurve
+                pass
+            if hasattr(action_tgt, 'assign_id'):
+                try:
+                    action_tgt.assign_id(None, key_tgt)
+                except:
+                    pass
 
         copied_curves = 0
         skipped_curves = 0
@@ -510,7 +499,7 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
 
                 # Get or create target fcurve
                 data_path = f'key_blocks["{key_name}"].value'
-                tgt_fcurve = self.get_or_create_fcurve(action_tgt, data_path, src_fcurve.array_index)
+                tgt_fcurve = self.get_or_create_fcurve(action_tgt, data_path, src_fcurve.array_index, key_tgt)
                 
                 if tgt_fcurve is None:
                     skipped_curves += 1
@@ -523,6 +512,12 @@ class ShapekeyAnimationTransferOperator(bpy.types.Operator):
                 except Exception as e:
                     skipped_curves += 1
 
+        # For Blender 5.0, ensure the slot is properly bound to the target shape_keys
+        if hasattr(action_tgt, 'slots') and len(action_tgt.slots) > 0:
+            slot = action_tgt.slots[0]
+            if hasattr(key_tgt.animation_data, 'action_slot_handle'):
+                key_tgt.animation_data.action_slot_handle = slot.handle
+        
         # Update scene
         context.view_layer.update()
 
